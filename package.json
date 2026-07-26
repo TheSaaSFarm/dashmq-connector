@@ -1,0 +1,52 @@
+{
+  "name": "dashmq-connector",
+  "version": "1.0.0",
+  "description": "Connects local Redis queues to DashMQ",
+  "preferGlobal": true,
+  "engine": {
+    "node": ">=18"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "module": "./dist/index.js",
+  "source": "lib/index.ts",
+  "bin": {
+    "dashmq": "app.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "bull": "^4.15.1",
+    "bullmq": "^5.34.10",
+    "bullmq-v3": "npm:bullmq@^3.16.2",
+    "bullmq-v4": "npm:bullmq@^4.18.2",
+    "bullmq-v5": "npm:bullmq@^5.47.0",
+    "chalk": "^4.1.0",
+    "commander": "^12.1.0",
+    "ioredis": "^5.4.1",
+    "node-fetch": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/bull": "^3.15.8",
+    "@types/chalk": "^2.2.0",
+    "@types/node": "^20.10.5",
+    "@types/node-fetch": "^2.6.11",
+    "typescript": "^5.3.3"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "npm run build && node --test tests/*.test.js",
+    "start": "node app.js",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "dashmq",
+    "bull",
+    "bullmq",
+    "queue",
+    "redis"
+  ],
+  "author": "",
+  "license": "MIT"
+}

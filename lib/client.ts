@@ -1,0 +1,265 @@
+import fetch from "node-fetch";
+import { Connection, ConnectionOptions, isRedisInstance, redisOptsFromConnection } from "./connection";
+import { getConnectionQueues, FoundQueue } from "./queue-factory";
+import { fullScan, detectChanges, QueueCounts, QueuePayload } from "./scanner";
+import { CommandExecutor } from "./commands";
+import { QueueRegistry } from "./queue-registry";
+import { RpcTransport } from "./rpc";
+import Redis from "ioredis";
+import chalk from "chalk";
+
+const { version } = require("../package.json");
+
+export class DashMQClient {
+  private name: string;
+  private token: string;
+  private connection: Connection;
+  private backend: string;
+  private opts: { queueNames?: string[] };
+  private intervalId?: NodeJS.Timeout;
+  private registry: QueueRegistry;
+  private redisConfig: ConnectionOptions; // Store Redis config to send to API
+
+  // Job scanning state
+  private isFirstSync: boolean = true;
+  private lastKnownCounts: Map<string, QueueCounts> = new Map();
+  private commandExecutor?: CommandExecutor;
+
+  // On-demand RPC transport. Runs alongside the 5s push loop, never instead of
+  // it: the push loop keeps the Postgres cache warm (and is the fallback the
+  // dashboard renders whenever RPC is off, slow, or unavailable), while RPC
+  // answers what the user is looking at right now.
+  private rpcTransport?: RpcTransport;
+  private connectionId?: string;
+
+  constructor(
+    name: string,
+    token: string,
+    connection: Connection | ConnectionOptions,
+    backend: string,
+    opts: { queueNames?: string[] } = {},
+  ) {
+    this.name = name;
+    this.token = token;
+    this.backend = backend;
+    this.opts = opts;
+
+    if (isRedisInstance(connection)) {
+      this.connection = connection;
+      // Extract config from Redis instance if possible
+      this.redisConfig = {
+        host: (connection as any).options?.host || "localhost",
+        port: (connection as any).options?.port || 6379,
+        password: (connection as any).options?.password,
+        db: (connection as any).options?.db || 0,
+      };
+      // Caller owns this client — the registry borrows it and will not close it.
+      this.registry = new QueueRegistry(connection);
+    } else {
+      const redisOpts = redisOptsFromConnection(connection);
+      this.connection = redisOpts;
+      // Store the original connection options
+      this.redisConfig = connection;
+      this.registry = new QueueRegistry(redisOpts);
+    }
+  }
+
+  /** Shared queue registry — scanning, commands and RPC all go through it. */
+  get queues(): QueueRegistry {
+    return this.registry;
+  }
+
+  async start() {
+    console.log(`${chalk.yellow("DashMQ:")} ${chalk.blueBright("Connecting to")} ${chalk.gray(this.backend)}`);
+
+    // Initial connection
+    await this.sendConnection();
+
+    // Poll every 5 seconds
+    this.intervalId = setInterval(() => {
+      this.sendConnection().catch((err) => {
+        console.error(chalk.red("[DashMQ] Error sending connection:"), err.message);
+      });
+    }, 5000);
+
+    console.log(chalk.yellow("DashMQ:") + chalk.green(" Connected and syncing queues every 5 seconds"));
+  }
+
+  async stop() {
+    if (this.intervalId) {
+      clearInterval(this.intervalId);
+      this.intervalId = undefined;
+    }
+    if (this.rpcTransport) {
+      await this.rpcTransport.stop();
+      this.rpcTransport = undefined;
+    }
+    await this.registry.close();
+  }
+
+  private async sendConnection() {
+    try {
+      // The registry owns the shared Redis client used for every raw read.
+      const redisConnection = this.registry.redis as Redis;
+
+      // 1. Discover queues (existing)
+      const queues = await getConnectionQueues(redisConnection, this.opts.queueNames);
+
+      // 1b. Reconcile the queue registry: new queues become resolvable, queues
+      // that disappeared get their clients closed.
+      await this.registry.refresh(queues);
+
+      // 2. Scan for job data
+      let queuePayloads: QueuePayload[];
+
+      if (this.isFirstSync) {
+        // First sync: full scan of all queues + all jobs
+        const scanResult = await fullScan(redisConnection, queues);
+        queuePayloads = scanResult.queues;
+        console.log(`${chalk.yellow("DashMQ:")} ${chalk.green("Full scan:")} ${chalk.blueBright(scanResult.totalJobs)} jobs across ${chalk.blueBright(queues.length)} queues`);
+        this.isFirstSync = false;
+      } else {
+        // Subsequent syncs: only push changed queues
+        const changedQueues = await detectChanges(redisConnection, queues, this.lastKnownCounts);
+
+        if (changedQueues.length > 0) {
+          const scanResult = await fullScan(redisConnection, changedQueues);
+          queuePayloads = scanResult.queues;
+
+          // Include unchanged queues without job data (just metadata)
+          const changedNames = new Set(changedQueues.map((q) => q.name));
+          for (const q of queues) {
+            if (!changedNames.has(q.name)) {
+              const counts = this.lastKnownCounts.get(q.name);
+              if (counts) {
+                queuePayloads.push({
+                  name: q.name,
+                  prefix: q.prefix,
+                  type: q.type,
+                  version: q.version,
+                  counts,
+                  jobs: [], // No job changes
+                });
+              }
+            }
+          }
+        } else {
+          // No changes — still send queue metadata with counts
+          queuePayloads = queues.map((q) => ({
+            name: q.name,
+            prefix: q.prefix,
+            type: q.type,
+            version: q.version,
+            counts: this.lastKnownCounts.get(q.name) || {
+              waiting: 0, active: 0, completed: 0, failed: 0, delayed: 0, paused: 0,
+            },
+            jobs: [],
+          }));
+        }
+      }
+
+      // 3. Extract Redis connection info to send to API
+      const redisInfo: any = {
+        host: this.redisConfig.host || "localhost",
+        port: this.redisConfig.port || 6379,
+        database: this.redisConfig.db || 0,
+      };
+
+      if (this.redisConfig.password) {
+        redisInfo.password = this.redisConfig.password;
+      }
+      if (this.redisConfig.username) {
+        redisInfo.username = this.redisConfig.username;
+      }
+      if (this.redisConfig.tls) {
+        redisInfo.useTLS = true;
+      }
+
+      // 4. Push queue data + jobs to /api/connector/sync
+      const response = await fetch(`${this.backend}/api/connector/sync`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${this.token}`,
+        },
+        body: JSON.stringify({
+          connection: this.name,
+          redis: redisInfo,
+          queues: queuePayloads,
+          version,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        if (response.status === 401) {
+          throw new Error("Authorization failed. Please check your token.");
+        }
+        throw new Error(`Server error: ${errorText}`);
+      }
+
+      const data = (await response.json()) as any;
+      if (data.success) {
+        const totalJobs = queuePayloads.reduce((sum, q) => sum + q.jobs.length, 0);
+        if (totalJobs > 0) {
+          console.log(`${chalk.yellow("DashMQ:")} ${chalk.green("Synced")} ${chalk.blueBright(queues.length)} queues, ${chalk.blueBright(totalJobs)} jobs`);
+        } else {
+          console.log(`${chalk.yellow("DashMQ:")} ${chalk.green("Synced")} ${chalk.blueBright(queues.length)} queues`);
+        }
+      }
+
+      const defaultPrefix = queues.length > 0 ? queues[0].prefix : "bull";
+
+      // 5. Poll for commands and execute them
+      if (!this.commandExecutor) {
+        this.commandExecutor = new CommandExecutor(this.registry, defaultPrefix);
+      }
+      await this.commandExecutor.pollAndExecute(this.token, this.backend);
+
+      // 6. Start (or keep) the on-demand RPC loop. It needs the dashboard's id
+      // for this connection, which only the sync response can tell us: an API
+      // token is account-level, so without an explicit connectionId the backend
+      // could hand this connector requests addressed at somebody else's Redis.
+      if (typeof data?.connectionId === "string" && data.connectionId) {
+        this.connectionId = data.connectionId;
+      }
+      this.ensureRpcTransport(defaultPrefix);
+    } catch (error: any) {
+      console.error(chalk.red("[DashMQ] Error:"), error.message);
+      throw error;
+    }
+  }
+
+  /**
+   * Bring up the on-demand RPC loop once, and keep its default queue prefix in
+   * step with discovery afterwards.
+   *
+   * The loop is safe to run before the feature is switched on server-side: the
+   * poll endpoint answers 204 immediately with a short retry hint while
+   * on-demand reads are disabled, which also keeps this connection marked as
+   * reachable so enabling the flag takes effect without a restart. Set
+   * DASHMQ_RPC=0 to opt out entirely.
+   */
+  private ensureRpcTransport(defaultPrefix: string) {
+    if (process.env.DASHMQ_RPC === "0") return;
+    if (!this.connectionId) return;
+
+    if (this.rpcTransport) {
+      this.rpcTransport.setDefaultPrefix(defaultPrefix);
+      return;
+    }
+
+    this.rpcTransport = new RpcTransport({
+      token: this.token,
+      backend: this.backend,
+      connectionId: this.connectionId,
+      registry: this.registry,
+      defaultPrefix,
+    });
+    this.rpcTransport.start();
+
+    console.log(
+      `${chalk.yellow("DashMQ:")} ${chalk.green("On-demand reads ready")} ${chalk.gray(`(connection ${this.connectionId})`)}`,
+    );
+  }
+}
