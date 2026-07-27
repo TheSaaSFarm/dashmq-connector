@@ -5,11 +5,11 @@
   "preferGlobal": true,
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/li0nwalk3r/dashmq-connector.git"
+    "url": "git+https://github.com/TheSaaSFarm/dashmq-connector.git"
   },
-  "homepage": "https://github.com/li0nwalk3r/dashmq-connector#readme",
+  "homepage": "https://github.com/TheSaaSFarm/dashmq-connector#readme",
   "bugs": {
-    "url": "https://github.com/li0nwalk3r/dashmq-connector/issues"
+    "url": "https://github.com/TheSaaSFarm/dashmq-connector/issues"
   },
   "engines": {
     "node": ">=18"
