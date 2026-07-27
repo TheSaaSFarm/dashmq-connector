@@ -1,9 +1,17 @@
 {
   "name": "dashmq-connector",
   "version": "1.0.0",
-  "description": "Connects local Redis queues to DashMQ",
+  "description": "Connect your Bull and BullMQ queues to DashMQ. Runs next to your Redis; you keep the credentials.",
   "preferGlobal": true,
-  "engine": {
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/li0nwalk3r/dashmq-connector.git"
+  },
+  "homepage": "https://github.com/li0nwalk3r/dashmq-connector#readme",
+  "bugs": {
+    "url": "https://github.com/li0nwalk3r/dashmq-connector/issues"
+  },
+  "engines": {
     "node": ">=18"
   },
   "main": "dist/index.js",
