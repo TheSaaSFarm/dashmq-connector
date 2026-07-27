@@ -1,16 +1,24 @@
 import { Redis, Cluster } from "ioredis";
 import { FoundQueue } from "./queue-factory";
+import type { RedactedJob, RedactionEngine } from "./redaction";
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
+/**
+ * A job exactly as Redis holds it. This shape never leaves the process: every
+ * function that reads jobs returns {@link RedactedJob}, which only the
+ * redaction engine can produce. See `fetchJobsBatch`.
+ */
 export interface JobData {
   id: string;
   name: string;
   status: string;
   data: any;
   opts: any;
+  /** BullMQ's "returnvalue". Carries payload-grade data and is redacted too. */
+  returnValue: any;
   progress: number;
   timestamp: number;
   processedOn: number | null;
@@ -41,7 +49,7 @@ export interface QueuePayload {
   type: string;
   version?: string;
   counts: QueueCounts;
-  jobs: JobData[];
+  jobs: RedactedJob[];
 }
 
 // ---------------------------------------------------------------------------
@@ -167,16 +175,26 @@ export async function getJobIds(
 
 const CHUNK_SIZE = 200;
 
+/**
+ * Read jobs out of Redis, redacted.
+ *
+ * This is the single choke point for job payloads: the push loop, `job.list`
+ * and `job.get` all arrive here, and there is no other way to turn a Redis hash
+ * into a job object. `redaction` is a required parameter rather than an
+ * optional one on purpose — an optional redactor is a redactor somebody
+ * forgets, and the compiler is the only reviewer that never gets tired.
+ */
 export async function fetchJobsBatch(
   redis: Redis | Cluster,
   queueName: string,
   status: string,
   jobIds: string[],
-  prefix: string
-): Promise<JobData[]> {
+  prefix: string,
+  redaction: RedactionEngine
+): Promise<RedactedJob[]> {
   if (jobIds.length === 0) return [];
 
-  const jobs: JobData[] = [];
+  const jobs: RedactedJob[] = [];
 
   for (let i = 0; i < jobIds.length; i += CHUNK_SIZE) {
     const chunk = jobIds.slice(i, i + CHUNK_SIZE);
@@ -193,11 +211,44 @@ export async function fetchJobsBatch(
 
       const jobData = data as Record<string, string>;
       const job = parseJobHash(chunk[j], queueName, status, jobData);
-      if (job) jobs.push(job);
+      if (job) jobs.push(redaction.redactJob(prefix, queueName, job));
     }
   }
 
   return jobs;
+}
+
+/**
+ * Job logs, redacted line by line.
+ *
+ * Both Bull and BullMQ push `job.log()` output onto `<prefix>:<queue>:<id>:logs`.
+ * Processors log whole user objects into it constantly, so this is a leak the
+ * size of the payload surface — and a path denylist cannot help, because a log
+ * line has no paths. The value detectors do the work instead.
+ *
+ * Like `fetchJobsBatch`, the engine is required: there is no way to read a log
+ * line out of Redis without passing it through redaction first.
+ */
+export async function fetchJobLogs(
+  redis: Redis | Cluster,
+  queueName: string,
+  jobId: string,
+  prefix: string,
+  redaction: RedactionEngine,
+  limit: number = 100
+): Promise<string[]> {
+  const key = `${prefix}:${queueName}:${jobId}:logs`;
+
+  let lines: string[];
+  try {
+    // Newest lines are appended, so the tail is the interesting end.
+    lines = await redis.lrange(key, -limit, -1);
+  } catch {
+    return [];
+  }
+
+  if (!Array.isArray(lines) || lines.length === 0) return [];
+  return redaction.redactLogs(prefix, queueName, lines);
 }
 
 function parseJobHash(
@@ -208,6 +259,7 @@ function parseJobHash(
 ): JobData | null {
   let parsedData: any = {};
   let parsedOpts: any = {};
+  let parsedReturnValue: any = null;
 
   try {
     if (hash.data) parsedData = JSON.parse(hash.data);
@@ -219,6 +271,15 @@ function parseJobHash(
     if (hash.opts) parsedOpts = JSON.parse(hash.opts);
   } catch {
     parsedOpts = hash.opts || {};
+  }
+
+  // Both Bull and BullMQ spell it "returnvalue". A worker's return value is
+  // payload-grade data (receipts, tokens, whole user records), so it is parsed
+  // here only so that redaction can see it before anything transmits it.
+  try {
+    if (hash.returnvalue) parsedReturnValue = JSON.parse(hash.returnvalue);
+  } catch {
+    parsedReturnValue = hash.returnvalue || null;
   }
 
   // Determine job name — same priority as cloud's getJobDetails
@@ -270,6 +331,7 @@ function parseJobHash(
     status: upperStatus,
     data: parsedData,
     opts: parsedOpts,
+    returnValue: parsedReturnValue,
     progress,
     timestamp,
     processedOn,
@@ -292,6 +354,7 @@ const STATUSES = ["waiting", "active", "completed", "failed", "delayed", "paused
 export async function fullScan(
   redis: Redis | Cluster,
   queues: FoundQueue[],
+  redaction: RedactionEngine,
   jobLimit: number = 50
 ): Promise<{ queues: QueuePayload[]; totalJobs: number }> {
   const result: QueuePayload[] = [];
@@ -299,11 +362,11 @@ export async function fullScan(
 
   for (const q of queues) {
     const counts = await getQueueCounts(redis, q.name, q.prefix);
-    const jobs: JobData[] = [];
+    const jobs: RedactedJob[] = [];
 
     for (const status of STATUSES) {
       const ids = await getJobIds(redis, q.name, status, q.prefix, jobLimit);
-      const batch = await fetchJobsBatch(redis, q.name, status, ids, q.prefix);
+      const batch = await fetchJobsBatch(redis, q.name, status, ids, q.prefix, redaction);
       jobs.push(...batch);
     }
 

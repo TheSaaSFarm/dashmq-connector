@@ -10,10 +10,12 @@ import { FoundQueue } from "./queue-factory";
 import {
   JobData,
   QueueCounts,
+  fetchJobLogs,
   fetchJobsBatch,
   getJobIds,
   getQueueCounts,
 } from "./scanner";
+import { RedactedJob, RedactionEngine, RedactionMode } from "./redaction";
 
 /**
  * On-demand RPC transport.
@@ -163,6 +165,20 @@ interface HandlerContext {
   registry: QueueRegistry;
   redis: Redis | Cluster;
   defaultPrefix: string;
+  redaction: RedactionEngine;
+}
+
+/** What the dashboard needs to say which policy produced a response. */
+interface RedactionStamp {
+  policy: string;
+  mode: RedactionMode;
+}
+
+function stampFor(ctx: HandlerContext, target: FoundQueue): RedactionStamp {
+  return {
+    policy: ctx.redaction.policyId,
+    mode: ctx.redaction.policyFor(target.prefix, target.name).rule.mode,
+  };
 }
 
 function asObject(params: any): Record<string, any> {
@@ -338,6 +354,7 @@ async function handleJobList(
   offset: number;
   limit: number;
   jobs: JobSummary[];
+  redaction: RedactionStamp;
 }> {
   const parsed = asObject(params);
   const name = requireString(parsed, "queue");
@@ -368,7 +385,8 @@ async function handleJobList(
     target.name,
     status,
     page,
-    target.prefix
+    target.prefix,
+    ctx.redaction
   );
 
   return {
@@ -377,15 +395,32 @@ async function handleJobList(
     status,
     offset,
     limit,
+    // Summaries carry no payload, so the per-job sidecar would be 100 copies of
+    // the same two facts. The stamp is hoisted to the page instead.
     jobs: jobs.map(toJobSummary),
+    redaction: stampFor(ctx, target),
   };
 }
 
-/** The one method that may return a payload, and only ever for a single job. */
+/** How many log lines one detail read may carry. */
+const MAX_JOB_LOG_LINES = 100;
+
+/**
+ * The one method that may return a payload, and only ever for a single job.
+ *
+ * It also returns the job's logs, which are the surface everyone forgets:
+ * `console.log(user)` inside a processor leaks at least as much as the payload
+ * it was logging. They come back detector-scrubbed like everything else.
+ */
 async function handleJobGet(
   ctx: HandlerContext,
   params: any
-): Promise<{ job: JobData | null; state: string | null }> {
+): Promise<{
+  job: RedactedJob | null;
+  state: string | null;
+  logs: string[];
+  redaction: RedactionStamp;
+}> {
   const parsed = asObject(params);
   const name = requireString(parsed, "queue");
   const jobId = requireString(parsed, "id");
@@ -398,7 +433,8 @@ async function handleJobGet(
     target.name,
     state ?? "unknown",
     [jobId],
-    target.prefix
+    target.prefix,
+    ctx.redaction
   );
 
   const job = jobs[0] ?? null;
@@ -407,7 +443,25 @@ async function handleJobGet(
     job.status = "UNKNOWN";
   }
 
-  return { job, state };
+  const wantsLogs = parsed.logs !== false;
+  const logs =
+    job && wantsLogs
+      ? await fetchJobLogs(
+          ctx.redis,
+          target.name,
+          jobId,
+          target.prefix,
+          ctx.redaction,
+          clamp(
+            Number.parseInt(String(parsed.logLimit ?? MAX_JOB_LOG_LINES), 10),
+            1,
+            MAX_JOB_LOG_LINES,
+            MAX_JOB_LOG_LINES
+          )
+        )
+      : [];
+
+  return { job, state, logs, redaction: stampFor(ctx, target) };
 }
 
 function clamp(
@@ -453,6 +507,8 @@ export interface RpcTransportOptions {
   /** The dashboard's id for this connection. RPC cannot run without it. */
   connectionId: string;
   registry: QueueRegistry;
+  /** Local redaction policy. Nothing reaches a response without it. */
+  redaction: RedactionEngine;
   /** Prefix used when the dashboard addresses a queue by bare name. */
   defaultPrefix?: string;
   /** Overridable for tests. */
@@ -464,6 +520,7 @@ export class RpcTransport {
   private readonly backend: string;
   private readonly connectionId: string;
   private readonly registry: QueueRegistry;
+  private readonly redaction: RedactionEngine;
   private readonly holdTimeoutMs: number;
 
   private defaultPrefix: string;
@@ -480,6 +537,7 @@ export class RpcTransport {
     this.backend = options.backend;
     this.connectionId = options.connectionId;
     this.registry = options.registry;
+    this.redaction = options.redaction;
     this.defaultPrefix = options.defaultPrefix || "bull";
     this.holdTimeoutMs = options.holdTimeoutMs ?? POLL_REQUEST_TIMEOUT_MS;
   }
@@ -551,6 +609,10 @@ export class RpcTransport {
             Authorization: `Bearer ${this.token}`,
             "x-dashmq-rpc-protocol": String(PROTOCOL_VERSION),
             "x-dashmq-rpc-capabilities": RPC_METHODS.join(","),
+            // The hash only. The policy itself is a local file and is never
+            // uploaded, quoted, or asked for.
+            "x-dashmq-redaction-policy": this.redaction.policyId,
+            "x-dashmq-redaction-mode": this.redaction.defaultMode,
           },
           signal: controller.signal as any,
           timeout: this.holdTimeoutMs,
@@ -619,6 +681,7 @@ export class RpcTransport {
       registry: this.registry,
       redis: this.registry.redis,
       defaultPrefix: this.defaultPrefix,
+      redaction: this.redaction,
     };
 
     const budget = Number.isFinite(deadline)

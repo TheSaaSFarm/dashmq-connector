@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "redaction": {
+    "default": {
+      "mode": "redact",
+      "strategy": "label",
+      "deny": [
+        "**.password",
+        "**.token",
+        "user.email",
+        "items[*].serialNumber",
+        "[\"customer.email\"]"
+      ],
+      "allow": [],
+      "detectors": ["jwt", "apiKey", "secret", "email", "iban", "creditCard", "phone"],
+      "maxDepth": 8,
+      "maxStringLength": 2048
+    },
+    "queues": {
+      "payments": {
+        "mode": "allowlist",
+        "allow": ["orderId", "amountCents", "currency", "failedReason"]
+      },
+      "internal-metrics": {
+        "mode": "all",
+        "deny": []
+      }
+    }
+  }
+}

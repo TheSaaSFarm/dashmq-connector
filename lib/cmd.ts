@@ -1,6 +1,7 @@
 import { Command } from "commander";
-import { blueBright, red } from "chalk";
+import { blueBright, red, yellow } from "chalk";
 import { Connect } from "./index";
+import { RedactionConfigError } from "./redaction-config";
 
 export const run = (name: string, version: string) => {
   console.info(
@@ -37,6 +38,11 @@ export const run = (name: string, version: string) => {
       process.env.DASHMQ_BACKEND || "http://localhost:3000"
     )
     .option("--queues <queues>", "optional comma-separated list of queues to monitor")
+    .option(
+      "-c, --config [path]",
+      "path to the local redaction policy (default: ./dashmq.config.json, then ~/.dashmq/config.json)",
+      process.env.DASHMQ_CONFIG
+    )
     .parse(process.argv);
 
   const options = program.opts();
@@ -81,9 +87,28 @@ export const run = (name: string, version: string) => {
     delete (connection as any).host;
   }
 
-  const client = Connect(options.name, options.token, connection, options.backend, {
-    queueNames,
-  });
+  // Building the client loads the local redaction policy. A policy that cannot
+  // be read or understood stops the connector here, before a single job is
+  // fetched — the alternative is transmitting under a policy nobody has read.
+  let client: ReturnType<typeof Connect>;
+  try {
+    client = Connect(options.name, options.token, connection, options.backend, {
+      queueNames,
+      configPath: options.config,
+    });
+  } catch (error: any) {
+    if (error instanceof RedactionConfigError) {
+      console.error(red("ERROR: redaction policy is unusable, refusing to start."));
+      console.error(red(`  ${error.message}`));
+      console.error(
+        yellow(
+          "  Fix the policy, or remove it to fall back to mode \"none\" (key names and value types only)."
+        )
+      );
+      process.exit(1);
+    }
+    throw error;
+  }
 
   client.start().catch((err) => {
     console.error(red("[DashMQ] Failed to start:"), err.message);

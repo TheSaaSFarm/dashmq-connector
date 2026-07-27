@@ -5,6 +5,7 @@ import { fullScan, detectChanges, QueueCounts, QueuePayload } from "./scanner";
 import { CommandExecutor } from "./commands";
 import { QueueRegistry } from "./queue-registry";
 import { RpcTransport } from "./rpc";
+import { RedactionEngine } from "./redaction";
 import Redis from "ioredis";
 import chalk from "chalk";
 
@@ -15,10 +16,19 @@ export class DashMQClient {
   private token: string;
   private connection: Connection;
   private backend: string;
-  private opts: { queueNames?: string[] };
+  private opts: { queueNames?: string[]; configPath?: string | null };
   private intervalId?: NodeJS.Timeout;
   private registry: QueueRegistry;
   private redisConfig: ConnectionOptions; // Store Redis config to send to API
+
+  /**
+   * Local redaction policy, loaded from disk once at construction.
+   *
+   * Constructing it can throw (RedactionConfigError) and deliberately is not
+   * caught here: a connector that cannot read its policy must not run. The CLI
+   * turns that throw into a clear message and a non-zero exit.
+   */
+  private redaction: RedactionEngine;
 
   // Job scanning state
   private isFirstSync: boolean = true;
@@ -37,12 +47,13 @@ export class DashMQClient {
     token: string,
     connection: Connection | ConnectionOptions,
     backend: string,
-    opts: { queueNames?: string[] } = {},
+    opts: { queueNames?: string[]; configPath?: string | null } = {},
   ) {
     this.name = name;
     this.token = token;
     this.backend = backend;
     this.opts = opts;
+    this.redaction = new RedactionEngine({ configPath: opts.configPath ?? null });
 
     if (isRedisInstance(connection)) {
       this.connection = connection;
@@ -69,8 +80,22 @@ export class DashMQClient {
     return this.registry;
   }
 
+  /** The live redaction policy. Read-only: nothing can change it at runtime. */
+  get redactionPolicy(): RedactionEngine {
+    return this.redaction;
+  }
+
   async start() {
     console.log(`${chalk.yellow("DashMQ:")} ${chalk.blueBright("Connecting to")} ${chalk.gray(this.backend)}`);
+    console.log(`${chalk.yellow("DashMQ:")} ${chalk.blueBright("Redaction:")} ${chalk.gray(this.redaction.describe())}`);
+
+    // A default that transmits values is not allowed to be quiet about it. This
+    // prints on every start, before the first sync, whenever no policy file
+    // exists — which is the state of every installation that upgrades into this
+    // release without doing anything.
+    for (const line of this.redaction.warnings()) {
+      console.warn(`${chalk.yellow("DashMQ:")} ${chalk.yellow(line)}`);
+    }
 
     // Initial connection
     await this.sendConnection();
@@ -109,12 +134,16 @@ export class DashMQClient {
       // that disappeared get their clients closed.
       await this.registry.refresh(queues);
 
+      // 1c. Resolve each queue's effective redaction policy once, here, rather
+      // than per job read. After this the per-job cost is a single tree walk.
+      this.redaction.prime(queues);
+
       // 2. Scan for job data
       let queuePayloads: QueuePayload[];
 
       if (this.isFirstSync) {
         // First sync: full scan of all queues + all jobs
-        const scanResult = await fullScan(redisConnection, queues);
+        const scanResult = await fullScan(redisConnection, queues, this.redaction);
         queuePayloads = scanResult.queues;
         console.log(`${chalk.yellow("DashMQ:")} ${chalk.green("Full scan:")} ${chalk.blueBright(scanResult.totalJobs)} jobs across ${chalk.blueBright(queues.length)} queues`);
         this.isFirstSync = false;
@@ -123,7 +152,7 @@ export class DashMQClient {
         const changedQueues = await detectChanges(redisConnection, queues, this.lastKnownCounts);
 
         if (changedQueues.length > 0) {
-          const scanResult = await fullScan(redisConnection, changedQueues);
+          const scanResult = await fullScan(redisConnection, changedQueues, this.redaction);
           queuePayloads = scanResult.queues;
 
           // Include unchanged queues without job data (just metadata)
@@ -187,6 +216,14 @@ export class DashMQClient {
           redis: redisInfo,
           queues: queuePayloads,
           version,
+          // The handshake reports which policy is live — its hash and its
+          // default mode, never its contents. The dashboard can display it and
+          // cannot influence it.
+          redaction: {
+            policy: this.redaction.policyId,
+            mode: this.redaction.defaultMode,
+            configured: this.redaction.configPath !== null,
+          },
         }),
       });
 
@@ -254,6 +291,7 @@ export class DashMQClient {
       backend: this.backend,
       connectionId: this.connectionId,
       registry: this.registry,
+      redaction: this.redaction,
       defaultPrefix,
     });
     this.rpcTransport.start();
