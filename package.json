@@ -14,6 +14,7 @@
   "engines": {
     "node": ">=20"
   },
+  "packageManager": "pnpm@10.28.1",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "module": "./dist/index.js",
