@@ -33,7 +33,7 @@
     "bullmq-v4": "npm:bullmq@^4.18.2",
     "bullmq-v5": "npm:bullmq@^5.47.0",
     "chalk": "^4.1.0",
-    "commander": "^12.1.0",
+    "commander": "^15.0.0",
     "ioredis": "^5.4.1",
     "node-fetch": "^2.7.0"
   },
