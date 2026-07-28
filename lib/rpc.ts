@@ -100,6 +100,7 @@ export const RPC_METHODS = [
   "queue.counts",
   "job.list",
   "job.get",
+  "job.exists",
   "redis.info",
 ] as const;
 
@@ -290,6 +291,70 @@ async function probeJobState(
 
 async function handlePing(): Promise<{ pong: true; at: number }> {
   return { pong: true, at: Date.now() };
+}
+
+/** Ceiling on how many jobs one existence probe may ask about. */
+const MAX_EXISTS_BATCH = 500;
+
+/**
+ * Which of the given jobs this Redis no longer holds.
+ *
+ * Retention on the dashboard deletes non-terminal job rows that have gone
+ * stale, but only once it has confirmed the job is really gone — a job still
+ * queued must never be deleted just because it sat untouched. For a connector
+ * connection the dashboard cannot check that itself: the Redis is inside this
+ * network. Without this method it has to skip the sweep entirely and those
+ * rows accumulate forever.
+ *
+ * Existence only: no field is read and nothing is returned but ids the caller
+ * already sent, so this cannot leak payloads. Both key prefixes are tested
+ * because a queue may be Bull's or BullMQ's, and a job counts as missing only
+ * when neither has it.
+ */
+async function handleJobExists(
+  ctx: HandlerContext,
+  params: any
+): Promise<{ missing: Array<{ queue: string; id: string }> }> {
+  const parsed = asObject(params);
+  const requested: any[] = Array.isArray(parsed.jobs) ? parsed.jobs : [];
+  if (requested.length === 0) return { missing: [] };
+  if (requested.length > MAX_EXISTS_BATCH) {
+    throw new RpcMethodError(
+      `"jobs" may not exceed ${MAX_EXISTS_BATCH} entries`,
+      "BAD_PARAMS"
+    );
+  }
+
+  // Resolved up front so an unknown queue fails the request rather than
+  // reporting its jobs as missing — "we cannot see that queue" and "those jobs
+  // are gone" must not look the same to a caller that deletes.
+  const targets = requested.map((entry) => {
+    const record = asObject(entry);
+    const queue = requireString(record, "queue");
+    const id = requireString(record, "id");
+    return { queue, id, target: resolveQueue(ctx, queue, record.prefix) };
+  });
+
+  const missing: Array<{ queue: string; id: string }> = [];
+  const CHUNK = 100;
+
+  for (let i = 0; i < targets.length; i += CHUNK) {
+    const chunk = targets.slice(i, i + CHUNK);
+    const pipeline = ctx.redis.pipeline();
+    for (const { id, target } of chunk) {
+      pipeline.exists(`${target.prefix}:${target.name}:${id}`);
+    }
+
+    const results = (await pipeline.exec()) || [];
+    for (let j = 0; j < chunk.length; j++) {
+      const [error, value] = results[j] || [null, 1];
+      // An errored probe is not evidence of absence.
+      if (error) continue;
+      if (value === 0) missing.push({ queue: chunk[j].queue, id: chunk[j].id });
+    }
+  }
+
+  return { missing };
 }
 
 /**
@@ -567,6 +632,8 @@ async function dispatch(
       return handleJobList(ctx, request.params);
     case "job.get":
       return handleJobGet(ctx, request.params);
+    case "job.exists":
+      return handleJobExists(ctx, request.params);
     case "redis.info":
       return handleRedisInfo(ctx);
     default:
