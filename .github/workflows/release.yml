@@ -1,0 +1,105 @@
+name: 🚀 Release
+
+# Publishing a GitHub Release ships that tag to npm. Nothing else does — no
+# git push publishes, and there is no long-lived npm token in this repo.
+#
+# Auth is npm Trusted Publishing (OIDC): npm is configured to trust this
+# repo + this workflow file, and the runner exchanges a short-lived GitHub
+# identity token for publish rights. A stolen repo secret cannot publish
+# because there is no publish secret to steal. It also stamps provenance, so
+# every version on npm links back to the commit and run that built it.
+#
+# ── One-time setup (in this order) ─────────────────────────────────────────
+#   1. Publish v1.0.0 by hand once — npm can only attach a trusted publisher
+#      to a package that already exists.
+#   2. npmjs.com → the package → Settings → Trusted Publisher → GitHub
+#      Actions: owner `TheSaaSFarm`, repo `dashmq-connector`, workflow
+#      `release.yml`, environment `npm-publish`.
+#   3. GitHub → Settings → Environments → new environment `npm-publish`,
+#      with yourself as a required reviewer. That is the human gate: every
+#      publish waits for an explicit approval click.
+#   4. npmjs.com → the package → Settings → require 2FA or trusted
+#      publishing for writes, so a leaked npm password cannot publish either.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # Same gate as every PR. A release republishes it rather than trusting that
+  # main was green when it was tagged.
+  gate:
+    name: 🧪 Gate
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: 🚀 Publish to npm
+    needs: gate
+    runs-on: ubuntu-latest
+    # Requires an approval before the job starts (see setup step 3), and is
+    # where the trusted-publishing claim is scoped.
+    environment:
+      name: npm-publish
+      url: https://www.npmjs.com/package/dashmq-connector
+    permissions:
+      contents: read
+      # Mints the OIDC token npm exchanges for publish rights, and signs the
+      # provenance attestation.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          # Needed by the ancestry check below.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      # setup-node ships whatever npm bundles with the Node release; trusted
+      # publishing needs 11.5.1 or newer.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Refuse to publish a tag that is not on main
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if ! git merge-base --is-ancestor "$TAG" origin/main; then
+            echo "::error::$TAG is not an ancestor of main. Releases ship reviewed code that reached main, not a side branch."
+            exit 1
+          fi
+          echo "$TAG is on main."
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # The tag is the source of truth for the version, so main never carries
+      # a version-bump commit. --allow-same-version keeps a re-run of a failed
+      # publish from erroring on the write.
+      - name: Stamp the version from the tag
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          VERSION="${TAG#v}"
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Release tag \"$TAG\" is not a semver version. Use vMAJOR.MINOR.PATCH, e.g. v1.2.3."
+            exit 1
+          fi
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          echo "Publishing $VERSION"
+
+      # `npm publish` runs the `prepare` script, which builds dist/ — it is
+      # gitignored, so this is what puts compiled output in the tarball.
+      - name: Publish
+        run: npm publish --provenance --access public

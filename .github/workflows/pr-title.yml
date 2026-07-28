@@ -1,0 +1,33 @@
+name: 🏷️ PR Title
+
+# Every PR title must be a Conventional Commit — the squash commit inherits
+# the PR title, and the draft release notes are built from those titles, so a
+# sloppy title becomes a sloppy changelog entry on npm.
+#
+#   feat(redaction): detect IBANs in nested payloads
+#   fix(rpc): stop leaking the raw job payload on summary pages
+#   chore: bump bullmq to 5.40
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: 🏷️ PR Title
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require a Conventional Commit title
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          echo "PR title: $TITLE"
+          if echo "$TITLE" | grep -qE '^(feat|fix|perf|refactor|chore|ci|docs|test|build|style|revert)(\([a-z0-9._/-]+\))?!?: .+'; then
+            echo "Title format OK."
+          else
+            echo "::error::PR title must be \"type(scope): description\" — e.g. \"fix(rpc): stop leaking the raw job payload\". Type and scope are lowercase, the scope is optional, and ! before the colon marks a breaking change. Allowed types: feat, fix, perf, refactor, chore, ci, docs, test, build, style, revert. This title becomes the squash commit and the release-note line."
+            exit 1
+          fi
