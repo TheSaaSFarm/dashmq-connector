@@ -100,6 +100,7 @@ export const RPC_METHODS = [
   "queue.counts",
   "job.list",
   "job.get",
+  "redis.info",
 ] as const;
 
 export type RpcMethod = (typeof RPC_METHODS)[number];
@@ -289,6 +290,83 @@ async function probeJobState(
 
 async function handlePing(): Promise<{ pong: true; at: number }> {
   return { pong: true, at: Date.now() };
+}
+
+/**
+ * The INFO keys `redis.info` may carry, and nothing else.
+ *
+ * INFO also reports things the dashboard has no business seeing from outside
+ * the customer's network — `executable`, `config_file`, `run_id`, replication
+ * peers with their IPs. An allowlist means a new Redis version cannot add a
+ * leaking key to our responses by existing; someone has to put it here on
+ * purpose, the same discipline {@link JobSummary} applies to job fields.
+ */
+const REDIS_INFO_KEYS = [
+  // server
+  "redis_version",
+  "redis_mode",
+  "os",
+  "uptime_in_seconds",
+  // clients
+  "connected_clients",
+  "blocked_clients",
+  // memory
+  "used_memory",
+  "used_memory_human",
+  "used_memory_peak_human",
+  "maxmemory",
+  "maxmemory_human",
+  "maxmemory_policy",
+  "total_system_memory",
+  "mem_fragmentation_ratio",
+  // stats
+  "total_commands_processed",
+  "instantaneous_ops_per_sec",
+  "keyspace_hits",
+  "keyspace_misses",
+  "expired_keys",
+  "evicted_keys",
+] as const;
+
+/**
+ * Parse raw INFO output down to the allowlisted keys.
+ *
+ * Exported for tests: the interesting behavior is the filtering, which must
+ * not need a live Redis to prove.
+ */
+export function parseRedisInfoText(raw: string): Record<string, string> {
+  const allowed = new Set<string>(REDIS_INFO_KEYS);
+  const info: Record<string, string> = {};
+
+  // INFO uses \r\n, but be liberal: some proxies rewrite line endings.
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line || line.startsWith("#")) continue;
+    const idx = line.indexOf(":");
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx);
+    if (allowed.has(key)) info[key] = line.slice(idx + 1).trim();
+  }
+
+  return info;
+}
+
+/**
+ * Instance facts for the dashboard's Redis card — version, memory, clients.
+ *
+ * This is the read that cannot work any other way: the dashboard cannot dial
+ * this Redis (that is the whole reason a connector is running), so before this
+ * method the instance card either showed nothing or, worse, whatever happened
+ * to answer on the *dashboard host's* localhost:6379.
+ *
+ * On a cluster client INFO answers from one node, so the numbers describe that
+ * node rather than the fleet — imperfect, but honestly labelled by
+ * `redis_mode: cluster` in the response.
+ */
+async function handleRedisInfo(
+  ctx: HandlerContext
+): Promise<{ info: Record<string, string> }> {
+  const raw = await ctx.redis.info();
+  return { info: parseRedisInfoText(String(raw)) };
 }
 
 async function handleQueueList(ctx: HandlerContext): Promise<{
@@ -489,6 +567,8 @@ async function dispatch(
       return handleJobList(ctx, request.params);
     case "job.get":
       return handleJobGet(ctx, request.params);
+    case "redis.info":
+      return handleRedisInfo(ctx);
     default:
       throw new RpcMethodError(
         `Unknown RPC method "${request.method}"`,
