@@ -42,7 +42,7 @@
     "@types/chalk": "^2.2.0",
     "@types/node": "^20.10.5",
     "@types/node-fetch": "^2.6.11",
-    "typescript": "^5.3.3"
+    "typescript": "^7.0.2"
   },
   "scripts": {
     "build": "tsc",
