@@ -22,7 +22,8 @@
     "dashmq": "app.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "app.js"
   ],
   "dependencies": {
     "bull": "^4.15.1",
