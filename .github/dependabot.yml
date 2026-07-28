@@ -1,0 +1,26 @@
+version: 2
+updates:
+  # This package sits next to a customer's Redis and holds their credentials,
+  # so a stale transitive dependency is their exposure, not just ours.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      # One PR for the routine noise, so the ones left standing alone are the
+      # ones worth reading.
+      minor-and-patch:
+        update-types: [minor, patch]
+
+  # Actions pinned by major tag still drift; this is the only thing watching
+  # the workflows that have publish rights.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci

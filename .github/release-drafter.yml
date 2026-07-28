@@ -1,0 +1,30 @@
+# Config for the 📝 Draft Release workflow.
+# PR titles are already linted to `type(scope): description`, so they group
+# cleanly by their Conventional Commit type — no labelling required.
+name-template: "v$RESOLVED_VERSION"
+tag-template: "v$RESOLVED_VERSION"
+change-template: "- $TITLE by @$AUTHOR (#$NUMBER)"
+
+categories:
+  - title: "💥 Breaking"
+    labels: [major, breaking]
+  - title: "✨ Features"
+    labels: [minor, feature, enhancement]
+  - title: "🐛 Fixes"
+    labels: [patch, fix, bug]
+  - title: "🔒 Security"
+    labels: [security]
+
+# A breaking change is the one thing a title cannot express on its own here:
+# label the PR `major` (or `breaking`) and the draft bumps the major version.
+version-resolver:
+  major:
+    labels: [major, breaking]
+  minor:
+    labels: [minor, feature, enhancement]
+  default: patch
+
+template: |
+  $CHANGES
+
+  **Install:** `npx dashmq@$RESOLVED_VERSION --help`

@@ -1,0 +1,134 @@
+name: 🧪 CI
+
+# This package runs on other people's machines, next to their Redis, so the
+# matrix is the point: every Node version the `engines` field claims support
+# for gets built and tested. Actions minutes are free on public repos, so
+# there is no reason to test fewer.
+#
+# Reusable (workflow_call) — 🚀 Release calls this as its gate, so nothing
+# reaches npm that has not passed here.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+# Least privilege, and it matters more here than on a private repo: this
+# workflow runs on pull requests from forks.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: 🧪 Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 22, 24]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # `pnpm test` is `tsc && node --test tests/*.test.js`, so this covers
+      # the typecheck too — there is no separate lint step to run.
+      - name: Build & test
+        run: pnpm test
+
+  package:
+    name: 📦 Package
+    runs-on: ubuntu-latest
+    # Catches the failure mode that unit tests cannot: a published tarball
+    # missing the file its `bin` entry points at. Packs the tarball the
+    # release would upload, installs it into an empty directory, and runs
+    # the CLI the way a customer would.
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Pack the tarball
+        run: |
+          npm pack
+          echo "TARBALL=$(ls dashmq-connector-*.tgz)" >> "$GITHUB_ENV"
+
+      - name: Install the tarball into a clean project and run the CLI
+        run: |
+          mkdir -p /tmp/smoke && cd /tmp/smoke
+          npm init -y > /dev/null
+          npm install "$GITHUB_WORKSPACE/$TARBALL"
+          npx dashmq --help
+          node -e "const m = require('dashmq-connector'); if (typeof m.Connect !== 'function') { throw new Error('Connect is not exported from the published tarball'); }"
+
+      - name: Upload the tarball
+        uses: actions/upload-artifact@v7
+        with:
+          name: npm-tarball
+          path: ${{ env.TARBALL }}
+          retention-days: 7
+
+  audit:
+    name: 🚨 Audit
+    runs-on: ubuntu-latest
+    # Informational — always green. Surfaces high/critical advisories as a
+    # step summary + warning annotation, deduped by package.
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: pnpm audit (informational)
+        run: |
+          pnpm audit --json > audit.json || true
+          node -e "
+            const fs = require('fs');
+            let a = {};
+            try { a = JSON.parse(fs.readFileSync('audit.json', 'utf8')); } catch {}
+            const v = (a.metadata && a.metadata.vulnerabilities) || {};
+            const high = v.high || 0, critical = v.critical || 0;
+            const lines = ['### 🚨 Audit — ' + high + ' high / ' + critical + ' critical', ''];
+            const seen = new Set();
+            const rows = [];
+            for (const adv of Object.values(a.advisories || {})) {
+              if (adv.severity !== 'critical' && adv.severity !== 'high') continue;
+              const key = adv.module_name + ':' + adv.severity;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              rows.push({ severity: adv.severity, text: '- **' + adv.module_name + '** (' + adv.severity + '): ' + adv.title });
+            }
+            rows.sort((x, y) => (x.severity === y.severity ? 0 : x.severity === 'critical' ? -1 : 1));
+            lines.push(...rows.slice(0, 25).map((r) => r.text));
+            if (rows.length > 25) lines.push('', '…and ' + (rows.length - 25) + ' more.');
+            fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, lines.join('\n') + '\n');
+            if (critical > 0) {
+              console.log('::warning::pnpm audit: ' + critical + ' critical vulnerabilities — review the 🚨 Audit step summary');
+            } else if (high > 0) {
+              console.log('::warning::pnpm audit: ' + high + ' high vulnerabilities (mostly transitive) — see the 🚨 Audit step summary');
+            }
+          "

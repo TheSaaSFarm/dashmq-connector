@@ -1,0 +1,31 @@
+name: 📝 Draft Release
+
+# Keeps ONE draft release up to date: every merge to main adds the PR to the
+# draft's notes and the draft proposes the next version (patch by default —
+# label a PR `minor` or `major` to bump further, or just edit the tag in the
+# draft).
+#
+# Publishing that draft is what ships to npm: it fires the 🚀 Release
+# workflow, which re-runs CI and then publishes. Nothing reaches npm from a
+# git push — only from a human clicking Publish.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: draft-release
+  cancel-in-progress: false
+
+jobs:
+  draft:
+    name: 📝 Update Draft Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: release-drafter/release-drafter@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,13 @@
+# On its own this file only *requests* a review. It becomes a hard gate once
+# the main ruleset turns on "Require review from Code Owners" — worth doing
+# the moment a second maintainer exists, since GitHub will not let you
+# approve your own PR and a single owner can only satisfy the rule by
+# bypassing it.
+*                       @li0nwalk3r
+
+# The supply-chain surface. Changing anything here changes what runs with
+# publish rights, or what ends up in the tarball customers install — these
+# deserve a second look even when the diff looks boring.
+/.github/               @li0nwalk3r
+/package.json           @li0nwalk3r
+/pnpm-lock.yaml         @li0nwalk3r
