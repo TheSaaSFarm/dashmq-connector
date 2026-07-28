@@ -11,6 +11,20 @@ import chalk from "chalk";
 
 const { version } = require("../package.json");
 
+/**
+ * How often the whole queue set is pushed to the dashboard.
+ *
+ * This was 5s, from when the push was the only way data ever arrived. It is
+ * not any more: the dashboard reads jobs live over RPC, so what the push
+ * still carries is queue counts, failure history and payloads — none of which
+ * anyone perceives at 5s rather than 30s. The old cadence re-scanned every
+ * queue twelve times a minute, forever, mostly to discover nothing had
+ * changed.
+ *
+ * Anything genuinely interactive goes over RPC and is not on a schedule.
+ */
+const PUSH_INTERVAL_MS = 30_000;
+
 /** Ceiling on a quoted response body. Enough to identify it, not to drown in it. */
 const MAX_BODY_CHARS = 300;
 
@@ -70,7 +84,7 @@ export class DashMQClient {
   private lastKnownCounts: Map<string, QueueCounts> = new Map();
   private commandExecutor?: CommandExecutor;
 
-  // On-demand RPC transport. Runs alongside the 5s push loop, never instead of
+  // On-demand RPC transport. Runs alongside the push loop, never instead of
   // it: the push loop keeps the Postgres cache warm (and is the fallback the
   // dashboard renders whenever RPC is off, slow, or unavailable), while RPC
   // answers what the user is looking at right now.
@@ -135,14 +149,16 @@ export class DashMQClient {
     // Initial connection
     await this.sendConnection();
 
-    // Poll every 5 seconds
     this.intervalId = setInterval(() => {
       this.sendConnection().catch((err) => {
         console.error(chalk.red("[DashMQ] Error sending connection:"), err.message);
       });
-    }, 5000);
+    }, PUSH_INTERVAL_MS);
 
-    console.log(chalk.yellow("DashMQ:") + chalk.green(" Connected and syncing queues every 5 seconds"));
+    console.log(
+      chalk.yellow("DashMQ:") +
+        chalk.green(` Connected and syncing queues every ${PUSH_INTERVAL_MS / 1000} seconds`)
+    );
   }
 
   async stop() {
