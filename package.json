@@ -1,6 +1,6 @@
 {
   "name": "dashmq-connector",
-  "version": "1.0.0",
+  "version": "1.3.0",
   "description": "Connect your Bull and BullMQ queues to DashMQ. Runs next to your Redis; you keep the credentials.",
   "preferGlobal": true,
   "repository": {
