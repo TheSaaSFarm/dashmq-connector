@@ -11,6 +11,41 @@ import chalk from "chalk";
 
 const { version } = require("../package.json");
 
+/** Ceiling on a quoted response body. Enough to identify it, not to drown in it. */
+const MAX_BODY_CHARS = 300;
+
+/**
+ * A failed sync described in terms of what went wrong, not by reprinting the
+ * server's answer.
+ *
+ * The previous version interpolated the raw body straight into the message.
+ * When a misaddressed backend answers with a Next.js 404 page, that is tens of
+ * kilobytes of minified RSC payload in the logs, once every five seconds,
+ * burying the one fact that matters: nothing is listening at that URL.
+ *
+ * An HTML body is itself the diagnosis — this endpoint always answers JSON, so
+ * markup means the request reached something other than DashMQ's API.
+ */
+export function describeHttpFailure(status: number, body: string): string {
+  const trimmed = body.trim();
+  const looksLikeHtml = /^<(?:!doctype|html)/i.test(trimmed);
+
+  if (looksLikeHtml) {
+    return (
+      `The backend URL did not answer with JSON (HTTP ${status}). ` +
+      `Check that it points at your DashMQ instance and includes no trailing path — ` +
+      `the connector appends /api/connector/sync itself.`
+    );
+  }
+
+  const quoted =
+    trimmed.length > MAX_BODY_CHARS
+      ? `${trimmed.slice(0, MAX_BODY_CHARS)}… (truncated)`
+      : trimmed || "(empty response)";
+
+  return `Server error (HTTP ${status}): ${quoted}`;
+}
+
 export class DashMQClient {
   private name: string;
   private token: string;
@@ -228,14 +263,23 @@ export class DashMQClient {
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
         if (response.status === 401) {
           throw new Error("Authorization failed. Please check your token.");
         }
-        throw new Error(`Server error: ${errorText}`);
+        throw new Error(describeHttpFailure(response.status, await response.text()));
       }
 
-      const data = (await response.json()) as any;
+      // A 200 is not a promise of JSON. A proxy, a login redirect or an error
+      // page can all answer 200 with HTML, and response.json() throws a parse
+      // error naming a character offset — which says nothing about the fact
+      // that the backend URL is pointing at the wrong server.
+      const raw = await response.text();
+      let data: any;
+      try {
+        data = JSON.parse(raw);
+      } catch {
+        throw new Error(describeHttpFailure(response.status, raw));
+      }
       if (data.success) {
         const totalJobs = queuePayloads.reduce((sum, q) => sum + q.jobs.length, 0);
         if (totalJobs > 0) {
